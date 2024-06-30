@@ -5,11 +5,18 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 import matplotlib.pyplot as plt
 from sklearn.metrics import classification_report, confusion_matrix
+from kerastuner import RandomSearch
+from kerastuner.engine.hyperparameters import HyperParameters
 
-# Data Preparation
+# Data Preparation and Feature Engineering
 def load_and_prepare_data(file_path):
     df = pd.read_csv(file_path)
-    X = df.drop('Class', axis=1)
+    
+    # Feature engineering
+    df['Amount_Log'] = np.log(df['Amount'] + 1)
+    df['Time_Bin'] = pd.cut(df['Time'], bins=24, labels=False)
+    
+    X = df.drop(['Class', 'Time', 'Amount'], axis=1)
     y = df['Class']
     
     scaler = StandardScaler()
@@ -17,39 +24,80 @@ def load_and_prepare_data(file_path):
     
     X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2, random_state=42)
     
-    X_train_normal = X_train[y_train == 0]
-    X_test_normal = X_test[y_test == 0]
-    X_test_fraud = X_test[y_test == 1]
-    
-    return X_train_normal, X_test_normal, X_test_fraud, X_test, y_test, scaler
+    return X_train, X_test, y_train, y_test, scaler
 
-# Model Building
-def build_autoencoder(input_dim):
-    input_layer = tf.keras.layers.Input(shape=(input_dim,))
+# Variational Autoencoder Model
+def sampling(args):
+    z_mean, z_log_var = args
+    batch = tf.shape(z_mean)[0]
+    dim = tf.shape(z_mean)[1]
+    epsilon = tf.keras.backend.random_normal(shape=(batch, dim))
+    return z_mean + tf.exp(0.5 * z_log_var) * epsilon
+
+def build_vae(hp):
+    input_dim = X_train.shape[1]
+    
+    inputs = tf.keras.layers.Input(shape=(input_dim,))
     
     # Encoder
-    encoder = tf.keras.layers.Dense(16, activation="relu")(input_layer)
-    encoder = tf.keras.layers.Dense(8, activation="relu")(encoder)
-    encoder = tf.keras.layers.Dense(4, activation="relu")(encoder)
+    x = tf.keras.layers.Dense(hp.Int('dense_1', 32, 128, step=32), activation='relu')(inputs)
+    x = tf.keras.layers.Dense(hp.Int('dense_2', 16, 64, step=16), activation='relu')(x)
+    
+    z_mean = tf.keras.layers.Dense(hp.Int('latent_dim', 2, 20, step=2))(x)
+    z_log_var = tf.keras.layers.Dense(hp.Int('latent_dim', 2, 20, step=2))(x)
+    z = tf.keras.layers.Lambda(sampling)([z_mean, z_log_var])
     
     # Decoder
-    decoder = tf.keras.layers.Dense(8, activation="relu")(encoder)
-    decoder = tf.keras.layers.Dense(16, activation="relu")(decoder)
-    decoder = tf.keras.layers.Dense(input_dim, activation="linear")(decoder)
+    x = tf.keras.layers.Dense(hp.Int('dense_2', 16, 64, step=16), activation='relu')(z)
+    x = tf.keras.layers.Dense(hp.Int('dense_1', 32, 128, step=32), activation='relu')(x)
+    outputs = tf.keras.layers.Dense(input_dim, activation='linear')(x)
     
-    autoencoder = tf.keras.models.Model(inputs=input_layer, outputs=decoder)
-    autoencoder.compile(optimizer='adam', loss='mean_squared_error')
+    vae = tf.keras.Model(inputs, outputs)
     
-    return autoencoder
+    reconstruction_loss = tf.keras.losses.mse(inputs, outputs)
+    reconstruction_loss *= input_dim
+    kl_loss = 1 + z_log_var - tf.square(z_mean) - tf.exp(z_log_var)
+    kl_loss = tf.reduce_mean(kl_loss)
+    kl_loss *= -0.5
+    vae_loss = tf.keras.backend.mean(reconstruction_loss + kl_loss)
+    vae.add_loss(vae_loss)
+    
+    vae.compile(optimizer=tf.keras.optimizers.Adam(hp.Choice('learning_rate', values=[1e-2, 1e-3, 1e-4])))
+    
+    return vae
+
+# Hyperparameter Tuning
+def tune_model(X_train, y_train):
+    tuner = RandomSearch(
+        build_vae,
+        objective='val_loss',
+        max_trials=5,
+        executions_per_trial=1,
+        directory='vae_tuning',
+        project_name='credit_card_anomaly'
+    )
+    
+    class_weight = {0: 1, 1: (y_train == 0).sum() / (y_train == 1).sum()}
+    
+    tuner.search(X_train, X_train, 
+                 epochs=10, 
+                 validation_split=0.2, 
+                 class_weight=class_weight)
+    
+    best_model = tuner.get_best_models(num_models=1)[0]
+    return best_model
 
 # Model Training
-def train_model(model, X_train, X_test, epochs=50, batch_size=32):
+def train_model(model, X_train, X_test, y_train, epochs=50, batch_size=32):
+    class_weight = {0: 1, 1: (y_train == 0).sum() / (y_train == 1).sum()}
+    
     history = model.fit(
         X_train, X_train,
         epochs=epochs,
         batch_size=batch_size,
         shuffle=True,
         validation_data=(X_test, X_test),
+        class_weight=class_weight,
         verbose=1
     )
     return history
@@ -79,13 +127,15 @@ def plot_error_distribution(normal_error, fraud_error):
 def reconstruction_error(x, x_pred):
     return np.mean(np.square(x - x_pred), axis=1)
 
-def detect_anomalies(model, X_test, X_test_normal, X_test_fraud, threshold_percentile=95):
+def detect_anomalies(model, X_test, y_test, threshold_percentile=95):
     X_test_pred = model.predict(X_test)
-    normal_error = reconstruction_error(X_test_normal, model.predict(X_test_normal))
-    fraud_error = reconstruction_error(X_test_fraud, model.predict(X_test_fraud))
+    errors = reconstruction_error(X_test, X_test_pred)
+    
+    normal_error = errors[y_test == 0]
+    fraud_error = errors[y_test == 1]
     
     threshold = np.percentile(normal_error, threshold_percentile)
-    y_pred = (reconstruction_error(X_test, X_test_pred) > threshold).astype(int)
+    y_pred = (errors > threshold).astype(int)
     
     return y_pred, normal_error, fraud_error, threshold
 
@@ -107,18 +157,19 @@ def detect_anomaly(transaction, model, scaler, threshold):
 # Main execution
 def main():
     # Load and prepare data
-    X_train_normal, X_test_normal, X_test_fraud, X_test, y_test, scaler = load_and_prepare_data('creditcard.csv')
+    X_train, X_test, y_train, y_test, scaler = load_and_prepare_data('creditcard.csv')
     
-    # Build and train model
-    input_dim = X_train_normal.shape[1]
-    model = build_autoencoder(input_dim)
-    history = train_model(model, X_train_normal, X_test_normal)
+    # Tune and build model
+    best_model = tune_model(X_train, y_train)
+    
+    # Train model
+    history = train_model(best_model, X_train, X_test, y_train)
     
     # Plot training history
     plot_training_history(history)
     
     # Detect anomalies
-    y_pred, normal_error, fraud_error, threshold = detect_anomalies(model, X_test, X_test_normal, X_test_fraud)
+    y_pred, normal_error, fraud_error, threshold = detect_anomalies(best_model, X_test, y_test)
     
     # Plot error distribution
     plot_error_distribution(normal_error, fraud_error)
@@ -128,14 +179,14 @@ def main():
     
     # Example of single transaction anomaly detection
     new_transaction = X_test[0]  # Using first transaction from test set as an example
-    is_anomaly, error = detect_anomaly(new_transaction, model, scaler, threshold)
+    is_anomaly, error = detect_anomaly(new_transaction, best_model, scaler, threshold)
     print(f"\nSingle Transaction Analysis:")
     print(f"Is this transaction anomalous? {'Yes' if is_anomaly else 'No'}")
     print(f"Reconstruction error: {error}")
     print(f"Threshold: {threshold}")
     
     # Save the model
-    model.save('credit_card_autoencoder.h5')
+    best_model.save('credit_card_vae.h5')
 
 if __name__ == "__main__":
     main()
