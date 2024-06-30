@@ -1,0 +1,5 @@
+creditcard.csv
+*.h5
+__pycache__
+*.pyc
+creditcard_anomaly_env
