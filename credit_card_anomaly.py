@@ -5,14 +5,13 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 import matplotlib.pyplot as plt
 from sklearn.metrics import classification_report, confusion_matrix
-from kerastuner import RandomSearch
-from kerastuner.engine.hyperparameters import HyperParameters
+from keras_tuner import RandomSearch
+from keras_tuner.engine.hyperparameters import HyperParameters
 
 # Data Preparation and Feature Engineering
 def load_and_prepare_data(file_path):
     df = pd.read_csv(file_path)
     
-    # Feature engineering
     df['Amount_Log'] = np.log(df['Amount'] + 1)
     df['Time_Bin'] = pd.cut(df['Time'], bins=24, labels=False)
     
@@ -35,19 +34,18 @@ def sampling(args):
     return z_mean + tf.exp(0.5 * z_log_var) * epsilon
 
 def build_vae(hp):
-    input_dim = X_train.shape[1]
+    input_dim = X_train.shape[1]  # This needs to be passed as an argument
     
     inputs = tf.keras.layers.Input(shape=(input_dim,))
     
-    # Encoder
     x = tf.keras.layers.Dense(hp.Int('dense_1', 32, 128, step=32), activation='relu')(inputs)
     x = tf.keras.layers.Dense(hp.Int('dense_2', 16, 64, step=16), activation='relu')(x)
     
-    z_mean = tf.keras.layers.Dense(hp.Int('latent_dim', 2, 20, step=2))(x)
-    z_log_var = tf.keras.layers.Dense(hp.Int('latent_dim', 2, 20, step=2))(x)
+    latent_dim = hp.Int('latent_dim', 2, 20, step=2)
+    z_mean = tf.keras.layers.Dense(latent_dim)(x)
+    z_log_var = tf.keras.layers.Dense(latent_dim)(x)
     z = tf.keras.layers.Lambda(sampling)([z_mean, z_log_var])
     
-    # Decoder
     x = tf.keras.layers.Dense(hp.Int('dense_2', 16, 64, step=16), activation='relu')(z)
     x = tf.keras.layers.Dense(hp.Int('dense_1', 32, 128, step=32), activation='relu')(x)
     outputs = tf.keras.layers.Dense(input_dim, activation='linear')(x)
@@ -105,8 +103,10 @@ def train_model(model, X_train, X_test, y_train, epochs=50, batch_size=32):
 # Plotting
 def plot_training_history(history):
     plt.figure(figsize=(12, 4))
-    plt.plot(history.history['loss'], label='Training Loss')
-    plt.plot(history.history['val_loss'], label='Validation Loss')
+    if 'loss' in history.history:
+        plt.plot(history.history['loss'], label='Training Loss')
+    if 'val_loss' in history.history:
+        plt.plot(history.history['val_loss'], label='Validation Loss')
     plt.title('Model Loss')
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
@@ -156,36 +156,27 @@ def detect_anomaly(transaction, model, scaler, threshold):
 
 # Main execution
 def main():
-    # Load and prepare data
     X_train, X_test, y_train, y_test, scaler = load_and_prepare_data('creditcard.csv')
     
-    # Tune and build model
     best_model = tune_model(X_train, y_train)
     
-    # Train model
     history = train_model(best_model, X_train, X_test, y_train)
     
-    # Plot training history
     plot_training_history(history)
     
-    # Detect anomalies
     y_pred, normal_error, fraud_error, threshold = detect_anomalies(best_model, X_test, y_test)
     
-    # Plot error distribution
     plot_error_distribution(normal_error, fraud_error)
     
-    # Evaluate model
     evaluate_model(y_test, y_pred)
     
-    # Example of single transaction anomaly detection
-    new_transaction = X_test[0]  # Using first transaction from test set as an example
+    new_transaction = X_test[0]
     is_anomaly, error = detect_anomaly(new_transaction, best_model, scaler, threshold)
     print(f"\nSingle Transaction Analysis:")
     print(f"Is this transaction anomalous? {'Yes' if is_anomaly else 'No'}")
     print(f"Reconstruction error: {error}")
     print(f"Threshold: {threshold}")
     
-    # Save the model
     best_model.save('credit_card_vae.h5')
 
 if __name__ == "__main__":
